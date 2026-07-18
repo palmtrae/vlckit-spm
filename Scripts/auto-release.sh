@@ -17,7 +17,7 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-for required_command in awk curl gh git grep mktemp sed shasum sleep swift tr unzip wc; do
+for required_command in awk curl gh git mktemp sed shasum sleep swift tr unzip wc; do
     require_command "$required_command"
 done
 
@@ -53,22 +53,29 @@ if [[ ! -s "$SELECTION_FILE" ]]; then
     exit 0
 fi
 
-release_exists() {
+release_record() {
     local tag="$1"
-    local output_path="$2"
-    local error_path="${RUN_DIRECTORY}/release-error.txt"
+    local records
+    local count
 
-    if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
-        >"$output_path" 2>"$error_path"; then
-        return 0
+    if ! records="$(
+        gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${tag}\") | [.id, .draft, .prerelease] | @tsv"
+    )"; then
+        return 2
     fi
 
-    if grep -q 'HTTP 404' "$error_path"; then
+    if [[ -z "$records" ]]; then
         return 1
     fi
 
-    cat "$error_path" >&2
-    die "could not inspect GitHub release $tag"
+    count="$(printf '%s\n' "$records" | wc -l | tr -d ' ')"
+    if [[ "$count" != "1" ]]; then
+        printf 'error: found %s releases for tag %s\n' "$count" "$tag" >&2
+        return 2
+    fi
+
+    printf '%s\n' "$records"
 }
 
 manifest_value_at_tag() {
@@ -158,6 +165,22 @@ verify_tag_manifest() {
     printf '%s\n' "$tag_checksum"
 }
 
+upload_release_asset() {
+    local release_id="$1"
+    local archive_path="$2"
+    local response_path="${RUN_DIRECTORY}/uploaded-asset.json"
+
+    curl --fail --show-error --location \
+        --request POST \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer ${GH_TOKEN}" \
+        --header "X-GitHub-Api-Version: 2022-11-28" \
+        --header "Content-Type: application/zip" \
+        --data-binary "@${archive_path}" \
+        --output "$response_path" \
+        "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?name=${ASSET_NAME}"
+}
+
 LAST_SELECTED_TAG=""
 DID_PUBLISH="false"
 
@@ -174,16 +197,18 @@ while IFS=$'\t' read -r upstream_version package_tag is_prerelease base_url \
         tag_exists="true"
     fi
 
-    release_json="${RUN_DIRECTORY}/release-${package_tag}.json"
     has_release="false"
-    if release_exists "$package_tag" "$release_json"; then
+    release_state=""
+    if release_state="$(release_record "$package_tag")"; then
         has_release="true"
+    else
+        release_status=$?
+        [[ $release_status -eq 1 ]] || \
+            die "could not inspect GitHub releases for $package_tag"
     fi
 
     if [[ "$has_release" == "true" ]]; then
-        release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${package_tag}" --jq '.id')"
-        is_draft="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${package_tag}" --jq '.draft')"
-        actual_prerelease="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${package_tag}" --jq '.prerelease')"
+        IFS=$'\t' read -r release_id is_draft actual_prerelease <<<"$release_state"
         [[ "$actual_prerelease" == "$is_prerelease" ]] || \
             die "release $package_tag has the wrong prerelease state"
 
@@ -253,39 +278,51 @@ while IFS=$'\t' read -r upstream_version package_tag is_prerelease base_url \
     fi
 
     if [[ "$has_release" == "false" ]]; then
-        create_arguments=(
-            "$package_tag"
-            --verify-tag
-            --draft
-            --title "VLCKit ${upstream_version}"
-            --notes-file "$release_notes"
-        )
-        if [[ "$is_prerelease" == "true" ]]; then
-            create_arguments+=(--prerelease --latest=false)
-        fi
-        gh release create "${create_arguments[@]}"
+        release_id="$(
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+                -F tag_name="$package_tag" \
+                -F name="VLCKit ${upstream_version}" \
+                -F body="@${release_notes}" \
+                -F draft=true \
+                -F prerelease="$is_prerelease" \
+                -F generate_release_notes=false \
+                --jq '.id'
+        )"
         has_release="true"
     else
-        gh release edit "$package_tag" \
-            --verify-tag \
-            --title "VLCKit ${upstream_version}" \
-            --notes-file "$release_notes" \
-            --prerelease="$is_prerelease"
+        gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F tag_name="$package_tag" \
+            -F name="VLCKit ${upstream_version}" \
+            -F body="@${release_notes}" \
+            -F draft=true \
+            -F prerelease="$is_prerelease" \
+            --silent
     fi
 
-    release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${package_tag}" --jq '.id')"
     existing_digest="$(asset_digest "$release_id" || true)"
     if [[ -n "$existing_digest" ]]; then
         [[ "$existing_digest" == "sha256:${generated_checksum}" ]] || \
             die "draft asset for $package_tag does not match its tagged manifest"
     else
-        gh release upload "$package_tag" "$readonly_archive"
+        upload_release_asset "$release_id" "$readonly_archive"
     fi
 
     verify_release_asset "$release_id" "$generated_checksum" true
-    gh release edit "$package_tag" \
-        --draft=false \
-        --prerelease="$is_prerelease"
+    make_latest="true"
+    [[ "$is_prerelease" == "false" ]] || make_latest="false"
+    gh api --method PATCH \
+        "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+        -F draft=false \
+        -F prerelease="$is_prerelease" \
+        -f make_latest="$make_latest" \
+        --silent
+    published_state="$(
+        gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            --jq '[.tag_name, .draft, .prerelease] | @tsv'
+    )"
+    [[ "$published_state" == "${package_tag}"$'\t'"false"$'\t'"${is_prerelease}" ]] || \
+        die "release $package_tag did not reach the expected published state"
     verify_release_asset "$release_id" "$generated_checksum" false
     DID_PUBLISH="true"
     printf 'Published VLCKit %s as %s.\n' "$upstream_version" "$package_tag"
