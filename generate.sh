@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-readonly DEFAULT_VIDEOLAN_BASE_URL="https://download.videolan.org/cocoapods/prod"
-readonly VIDEOLAN_BASE_URL="${VIDEOLAN_BASE_URL:-$DEFAULT_VIDEOLAN_BASE_URL}"
+readonly VIDEOLAN_PRODUCTION_URL="https://download.videolan.org/cocoapods/prod"
+readonly VIDEOLAN_UNSTABLE_URL="https://download.videolan.org/cocoapods/unstable"
 readonly BINARY_TARGET_NAME="VLCKit-all"
 readonly RELEASE_ARCHIVE_NAME="${BINARY_TARGET_NAME}.xcframework.zip"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,13 +11,15 @@ readonly WORK_DIR="${SCRIPT_DIR}/.tmp"
 
 usage() {
     cat <<EOF
-Usage: ./generate.sh <vlckit-tag>
+Usage: ./generate.sh <upstream-vlckit-version>
 
 Example:
   ./generate.sh 3.7.3
+  ./generate.sh 3.8.0b1
 
 The script discovers the matching MobileVLCKit, TVVLCKit, and VLCKit
-archives from VideoLAN, then updates Package.swift for this Git fork.
+archives from VideoLAN, then updates Package.swift for this Git fork. A beta
+such as 3.8.0b1 is published with the SwiftPM-compatible tag 3.8.0-b1.
 EOF
 }
 
@@ -40,62 +42,91 @@ fi
     exit 2
 }
 
-readonly TAG_VERSION="$1"
-[[ "$TAG_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || \
-    die "invalid VLCKit tag: $TAG_VERSION"
+readonly UPSTREAM_VERSION="$1"
+if [[ "$UPSTREAM_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    readonly PACKAGE_TAG="$UPSTREAM_VERSION"
+    readonly IS_PRERELEASE="false"
+elif [[ "$UPSTREAM_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)b([0-9]+)$ ]]; then
+    readonly PACKAGE_TAG="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-b${BASH_REMATCH[4]}"
+    readonly IS_PRERELEASE="true"
+else
+    die "unsupported VLCKit version: $UPSTREAM_VERSION"
+fi
 
-for required_command in curl tar find sort xcodebuild ditto swift sed git; do
+for required_command in curl tar find sort xcodebuild swift sed git zip touch; do
     require_command "$required_command"
 done
 
 cd "$SCRIPT_DIR"
 [[ "$WORK_DIR" == "$SCRIPT_DIR/.tmp" ]] || die "refusing to use unexpected work directory"
 
-printf 'Fetching VideoLAN artifact index...\n'
-ARTIFACT_INDEX="$({
-    curl --fail --silent --show-error --location --retry 3 \
-        "${VIDEOLAN_BASE_URL}/"
-})"
-readonly ARTIFACT_INDEX
+if [[ -n "${VIDEOLAN_BASE_URL:-}" ]]; then
+    source_urls=("${VIDEOLAN_BASE_URL%/}")
+else
+    source_urls=("$VIDEOLAN_PRODUCTION_URL" "$VIDEOLAN_UNSTABLE_URL")
+fi
 
-artifact_names=()
-while IFS= read -r artifact_name; do
-    [[ -n "$artifact_name" ]] && artifact_names+=("$artifact_name")
-done < <(
-    printf '%s\n' "$ARTIFACT_INDEX" |
-        sed -n 's/.*href="\([^"]*\.tar\.xz\)".*/\1/p'
-)
+SELECTED_BASE_URL=""
+IOS_ARTIFACT=""
+TVOS_ARTIFACT=""
+MACOS_ARTIFACT=""
 
-[[ ${#artifact_names[@]} -gt 0 ]] || \
-    die "no .tar.xz artifacts found at $VIDEOLAN_BASE_URL"
+for source_url in "${source_urls[@]}"; do
+    printf 'Fetching VideoLAN artifact index: %s\n' "$source_url"
+    artifact_index="$(
+        curl --fail --silent --show-error --location --retry 3 "${source_url}/"
+    )"
 
-discover_artifact() {
-    local product_name="$1"
-    local artifact_name
-    local -a matches=()
+    ios_match=""
+    tvos_match=""
+    macos_match=""
+    ios_count=0
+    tvos_count=0
+    macos_count=0
+    while IFS= read -r artifact_name; do
+        case "$artifact_name" in
+            "MobileVLCKit-${UPSTREAM_VERSION}-"*.tar.xz)
+                ios_match="$artifact_name"
+                ios_count=$((ios_count + 1))
+                ;;
+            "TVVLCKit-${UPSTREAM_VERSION}-"*.tar.xz)
+                tvos_match="$artifact_name"
+                tvos_count=$((tvos_count + 1))
+                ;;
+            "VLCKit-${UPSTREAM_VERSION}-"*.tar.xz)
+                macos_match="$artifact_name"
+                macos_count=$((macos_count + 1))
+                ;;
+        esac
+    done < <(
+        printf '%s\n' "$artifact_index" |
+            sed -n 's/.*href="\([^"]*\.tar\.xz\)".*/\1/p'
+    )
 
-    for artifact_name in "${artifact_names[@]}"; do
-        if [[ "$artifact_name" == "${product_name}-${TAG_VERSION}-"*.tar.xz ]]; then
-            matches+=("$artifact_name")
-        fi
-    done
-
-    if [[ ${#matches[@]} -ne 1 ]]; then
-        printf 'error: expected one %s %s artifact, found %d\n' \
-            "$product_name" "$TAG_VERSION" "${#matches[@]}" >&2
-        if [[ ${#matches[@]} -gt 0 ]]; then
-            printf '  %s\n' "${matches[@]}" >&2
-        fi
-        return 1
+    if [[ $ios_count -gt 1 || $tvos_count -gt 1 || $macos_count -gt 1 ]]; then
+        die "ambiguous $UPSTREAM_VERSION artifacts at $source_url"
     fi
 
-    printf '%s\n' "${matches[0]}"
-}
+    if [[ $ios_count -eq 1 && $tvos_count -eq 1 && $macos_count -eq 1 ]]; then
+        SELECTED_BASE_URL="$source_url"
+        IOS_ARTIFACT="$ios_match"
+        TVOS_ARTIFACT="$tvos_match"
+        MACOS_ARTIFACT="$macos_match"
+        break
+    fi
+done
 
-IOS_ARTIFACT="$(discover_artifact MobileVLCKit)"
-TVOS_ARTIFACT="$(discover_artifact TVVLCKit)"
-MACOS_ARTIFACT="$(discover_artifact VLCKit)"
-readonly IOS_ARTIFACT TVOS_ARTIFACT MACOS_ARTIFACT
+[[ -n "$SELECTED_BASE_URL" ]] || \
+    die "could not find one complete artifact set for $UPSTREAM_VERSION"
+
+[[ -z "${EXPECTED_MOBILE_ARTIFACT:-}" || "$IOS_ARTIFACT" == "$EXPECTED_MOBILE_ARTIFACT" ]] || \
+    die "discovered MobileVLCKit artifact does not match the selected candidate"
+[[ -z "${EXPECTED_TV_ARTIFACT:-}" || "$TVOS_ARTIFACT" == "$EXPECTED_TV_ARTIFACT" ]] || \
+    die "discovered TVVLCKit artifact does not match the selected candidate"
+[[ -z "${EXPECTED_MACOS_ARTIFACT:-}" || "$MACOS_ARTIFACT" == "$EXPECTED_MACOS_ARTIFACT" ]] || \
+    die "discovered VLCKit artifact does not match the selected candidate"
+
+readonly SELECTED_BASE_URL IOS_ARTIFACT TVOS_ARTIFACT MACOS_ARTIFACT
 
 rm -rf -- "$WORK_DIR"
 mkdir -p "$WORK_DIR"
@@ -104,10 +135,18 @@ download_and_extract() {
     local product_name="$1"
     local artifact_name="$2"
     local archive_path="${WORK_DIR}/${product_name}.tar.xz"
-    local artifact_url="${VIDEOLAN_BASE_URL}/${artifact_name}"
+    local artifact_url="${SELECTED_BASE_URL}/${artifact_name}"
 
     printf 'Downloading %s\n' "$artifact_name"
     curl --fail --location --retry 3 --output "$archive_path" "$artifact_url"
+
+    while IFS= read -r archive_entry; do
+        [[ "$archive_entry" != /* ]] || die "archive contains an absolute path: $artifact_name"
+        case "/${archive_entry}/" in
+            */../*) die "archive contains a parent traversal: $artifact_name" ;;
+        esac
+    done < <(tar -tf "$archive_path")
+
     tar -xf "$archive_path" -C "$WORK_DIR"
 }
 
@@ -185,7 +224,11 @@ xcodebuild -create-xcframework \
     "${framework_arguments[@]}" \
     -output "$OUTPUT_XCFRAMEWORK"
 
-ditto -c -k --sequesterRsrc --keepParent "$OUTPUT_XCFRAMEWORK" "$OUTPUT_ARCHIVE"
+"${SCRIPT_DIR}/Scripts/normalize-xcframework-plist.swift" \
+    "${OUTPUT_XCFRAMEWORK}/Info.plist"
+
+"${SCRIPT_DIR}/Scripts/create-deterministic-zip.sh" \
+    "$OUTPUT_XCFRAMEWORK" "$OUTPUT_ARCHIVE"
 
 discover_repository_slug() {
     local repository_slug="${GITHUB_REPOSITORY:-}"
@@ -219,7 +262,7 @@ discover_repository_slug() {
 REPOSITORY_SLUG="$(discover_repository_slug)"
 PACKAGE_HASH="$(swift package compute-checksum "$OUTPUT_ARCHIVE")"
 readonly REPOSITORY_SLUG PACKAGE_HASH
-readonly RELEASE_URL="https://github.com/${REPOSITORY_SLUG}/releases/download/${TAG_VERSION}/${RELEASE_ARCHIVE_NAME}"
+readonly RELEASE_URL="https://github.com/${REPOSITORY_SLUG}/releases/download/${PACKAGE_TAG}/${RELEASE_ARCHIVE_NAME}"
 readonly PACKAGE_DECLARATION="let vlcBinary = Target.binaryTarget(name: \"${BINARY_TARGET_NAME}\", url: \"${RELEASE_URL}\", checksum: \"${PACKAGE_HASH}\")"
 
 printf 'Updating Package.swift with checksum %s\n' "$PACKAGE_HASH"
@@ -231,11 +274,29 @@ license_path="$(find "$WORK_DIR" -type f -path '*/MobileVLCKit-binary/COPYING.tx
 [[ -n "$license_path" ]] || die "MobileVLCKit license file not found"
 cp -f "$license_path" "$SCRIPT_DIR/LICENSE"
 
+readonly RELEASE_NOTES_PATH="${WORK_DIR}/release-notes.md"
+readonly RELEASE_INFO_PATH="${WORK_DIR}/release-info.tsv"
+
+cat >"$RELEASE_NOTES_PATH" <<EOF
+Packaged from the official VideoLAN VLCKit **${UPSTREAM_VERSION}** artifacts.
+
+- MobileVLCKit: [${IOS_ARTIFACT}](${SELECTED_BASE_URL}/${IOS_ARTIFACT})
+- TVVLCKit: [${TVOS_ARTIFACT}](${SELECTED_BASE_URL}/${TVOS_ARTIFACT})
+- VLCKit: [${MACOS_ARTIFACT}](${SELECTED_BASE_URL}/${MACOS_ARTIFACT})
+- SwiftPM tag: \`${PACKAGE_TAG}\`
+- SHA-256: \`${PACKAGE_HASH}\`
+EOF
+
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$UPSTREAM_VERSION" "$PACKAGE_TAG" "$IS_PRERELEASE" \
+    "$SELECTED_BASE_URL" "$IOS_ARTIFACT" "$TVOS_ARTIFACT" \
+    "$MACOS_ARTIFACT" "$PACKAGE_HASH" >"$RELEASE_INFO_PATH"
+
 cat <<EOF
 
 Generated: $OUTPUT_ARCHIVE
 Updated:   $SCRIPT_DIR/Package.swift
 Release:   $RELEASE_URL
 
-Create the GitHub release for tag $TAG_VERSION and upload $RELEASE_ARCHIVE_NAME.
+Create the GitHub release for tag $PACKAGE_TAG and upload $RELEASE_ARCHIVE_NAME.
 EOF
